@@ -118,9 +118,10 @@ def decide_search(question: str, model: str) -> Tuple[bool, str]:
     raw_response = ollama_chat(model, messages)
     try:
         parsed = json.loads(raw_response)
-        return bool(parsed.get("search", False)), str(parsed.get("query", question))
+        query = str(parsed.get("query", question)).strip() or question
+        return bool(parsed.get("search", False)), query
     except json.JSONDecodeError:
-        return False, question
+        return True, question
 
 
 def format_user_with_sources(question: str, context: str) -> str:
@@ -172,7 +173,9 @@ def main() -> None:
 
             if retrieval_mode == "Always Wikipedia":
                 status.write("Retrieval: forcing Wikipedia search")
-                search_results = wiki_search(prompt, user_agent=user_agent)
+                _, query = decide_search(prompt, model)
+                status.write(f"Search query: '{query}'")
+                search_results = wiki_search(query, user_agent=user_agent)
             elif retrieval_mode == "Auto":
                 status.write("Retrieval: deciding whether to search Wikipedia")
                 should_search, query = decide_search(prompt, model)
