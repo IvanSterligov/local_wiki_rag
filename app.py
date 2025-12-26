@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 import httpx
@@ -69,6 +70,26 @@ def wiki_search(query: str, limit: int = DEFAULT_SEARCH_LIMIT, user_agent: str =
     except Exception as exc:  # pylint: disable=broad-exception-caught
         st.error(f"Wikipedia search error: {exc}")
         return []
+
+
+def rank_search_results(
+    search_results: List[Dict[str, Any]], query: str, limit: int
+) -> List[Dict[str, Any]]:
+    tokens = [tok.lower() for tok in re.findall(r"\b\w+\b", query) if len(tok) > 2]
+
+    def score(result: Dict[str, Any]) -> Tuple[int, float]:
+        haystack = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+        token_hits = sum(1 for tok in tokens if tok in haystack)
+        return token_hits, float(result.get("score", 0.0))
+
+    ranked = sorted(search_results, key=score, reverse=True)
+
+    if tokens:
+        positive_hits = [res for res in ranked if score(res)[0] > 0]
+        if positive_hits:
+            ranked = positive_hits
+
+    return ranked[:limit]
 
 
 def wiki_extracts(pageids: List[int], chars: int = DEFAULT_EXTRACT_CHARS, user_agent: str = DEFAULT_USER_AGENT) -> Dict[int, Dict[str, Any]]:
@@ -152,6 +173,7 @@ def main() -> None:
         retrieval_mode = st.selectbox("Retrieval mode", options=RETRIEVAL_MODES, index=0)
     with col3:
         user_agent = st.text_input("Wikipedia User-Agent", value=DEFAULT_USER_AGENT)
+    max_sources = st.slider("Max Wikipedia sources", 5, 50, DEFAULT_SEARCH_LIMIT, 1)
 
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
@@ -174,8 +196,8 @@ def main() -> None:
             if retrieval_mode == "Always Wikipedia":
                 status.write("Retrieval: forcing Wikipedia search")
                 _, query = decide_search(prompt, model)
-                status.write(f"Search query: '{query}'")
-                search_results = wiki_search(query, user_agent=user_agent)
+                status.write(f"Search query: '{query}' (limit {max_sources})")
+                search_results = wiki_search(query, limit=max_sources, user_agent=user_agent)
             elif retrieval_mode == "Auto":
                 status.write("Retrieval: deciding whether to search Wikipedia")
                 should_search, query = decide_search(prompt, model)
@@ -184,10 +206,11 @@ def main() -> None:
                     + (f"searching Wikipedia for '{query}'" if should_search else "no search needed")
                 )
                 if should_search:
-                    search_results = wiki_search(query, user_agent=user_agent)
+                    search_results = wiki_search(query, limit=max_sources, user_agent=user_agent)
             # No Wikipedia mode skips retrieval
 
             if search_results:
+                search_results = rank_search_results(search_results, query, max_sources)
                 status.write(f"Wikipedia results: {len(search_results)} matches")
                 pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
                 extracts = wiki_extracts(pageids, user_agent=user_agent)
