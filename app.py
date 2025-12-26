@@ -17,9 +17,10 @@ OLLAMA_URL = "http://localhost:11434"
 OLLAMA_CHAT_ENDPOINT = f"{OLLAMA_URL}/api/chat"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 DEFAULT_SEARCH_LIMIT = 5
-SEARCH_BACKEND_LIMIT = 20
+SEARCH_BACKEND_LIMIT = 50
 DEFAULT_EXTRACT_CHARS = 1200
-RERANK_TOP_K = 5
+MAX_SOURCES_CAP = 50
+RERANK_TOP_K = MAX_SOURCES_CAP
 CHUNK_TOKEN_TARGET = 300
 REQUEST_TIMEOUT = 30.0
 DEFAULT_USER_AGENT = os.getenv("WIKI_USER_AGENT", "LocalWikiRAG/1.0 (contact: local)")
@@ -40,7 +41,8 @@ TOOL_GATING_PROMPT = (
 ANSWER_SYSTEM_PROMPT = (
     "You are a local assistant. Use the SOURCES section when it is provided. "
     "Cite sources with [n] where n corresponds to the source number. "
-    "If SOURCES is empty, answer normally and clearly state when you do not have Wikipedia matches."
+    "If SOURCES is empty, answer normally and clearly state when you do not have Wikipedia matches. "
+    "Provide a thorough response roughly a page in length, elaborating on relevant context and details."
 )
 
 
@@ -90,7 +92,17 @@ def wiki_search(
     try:
         resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        return resp.json().get("query", {}).get("search", [])
+        results = resp.json().get("query", {}).get("search", [])
+        if results:
+            return results
+        # Fallback: try the raw query if the refined one yielded nothing.
+        if refined_query != query:
+            fallback_params = params.copy()
+            fallback_params["srsearch"] = query
+            resp = httpx.get(WIKI_API, params=fallback_params, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json().get("query", {}).get("search", [])
+        return results
     except Exception as exc:  # pylint: disable-broad-exception-caught
         st.error(f"Wikipedia search error: {exc}")
         return []
@@ -249,7 +261,7 @@ def main() -> None:
     with col3:
         user_agent = st.text_input("Wikipedia User-Agent", value=DEFAULT_USER_AGENT)
     max_sources = st.slider(
-        "Max Wikipedia sources (reranked)", 3, RERANK_TOP_K, min(DEFAULT_SEARCH_LIMIT, RERANK_TOP_K), 1
+        "Max Wikipedia sources (reranked)", 3, MAX_SOURCES_CAP, min(DEFAULT_SEARCH_LIMIT, MAX_SOURCES_CAP), 1
     )
 
     for message in st.session_state["messages"]:
