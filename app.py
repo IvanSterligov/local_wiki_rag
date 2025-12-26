@@ -161,36 +161,54 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        search_results: List[Dict[str, Any]] = []
-        extracts: Dict[int, Dict[str, Any]] = {}
-        context = ""
-        sources_display: List[Dict[str, str]] = []
+        with st.status("Processing request", expanded=True) as status:
+            status.write(f"Model: {model}")
+            status.write(f"Retrieval mode: {retrieval_mode}")
 
-        if retrieval_mode == "Always Wikipedia":
-            search_results = wiki_search(prompt, user_agent=user_agent)
-        elif retrieval_mode == "Auto":
-            should_search, query = decide_search(prompt, model)
-            if should_search:
-                search_results = wiki_search(query, user_agent=user_agent)
-        # No Wikipedia mode skips retrieval
+            search_results: List[Dict[str, Any]] = []
+            extracts: Dict[int, Dict[str, Any]] = {}
+            context = ""
+            sources_display: List[Dict[str, str]] = []
 
-        if search_results:
-            pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
-            extracts = wiki_extracts(pageids, user_agent=user_agent)
-            context, sources_display = build_context(search_results, extracts)
+            if retrieval_mode == "Always Wikipedia":
+                status.write("Retrieval: forcing Wikipedia search")
+                search_results = wiki_search(prompt, user_agent=user_agent)
+            elif retrieval_mode == "Auto":
+                status.write("Retrieval: deciding whether to search Wikipedia")
+                should_search, query = decide_search(prompt, model)
+                status.write(
+                    "Auto decision: "
+                    + (f"searching Wikipedia for '{query}'" if should_search else "no search needed")
+                )
+                if should_search:
+                    search_results = wiki_search(query, user_agent=user_agent)
+            # No Wikipedia mode skips retrieval
 
-        render_sources(sources_display)
+            if search_results:
+                status.write(f"Wikipedia results: {len(search_results)} matches")
+                pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
+                extracts = wiki_extracts(pageids, user_agent=user_agent)
+                context, sources_display = build_context(search_results, extracts)
+                status.write(f"Built context from {len(sources_display)} sources")
+            else:
+                status.write("Wikipedia search returned no results")
 
-        answer_messages = [
-            {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-            {"role": "user", "content": format_user_with_sources(prompt, context)},
-        ]
-        assistant_reply = ollama_chat(model, answer_messages)
-        if not assistant_reply:
-            assistant_reply = "I could not generate a response at this time."
-        with st.chat_message("assistant"):
-            st.markdown(assistant_reply)
-        st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
+            render_sources(sources_display)
+
+            answer_messages = [
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+                {"role": "user", "content": format_user_with_sources(prompt, context)},
+            ]
+            assistant_reply = ollama_chat(model, answer_messages)
+            if not assistant_reply:
+                assistant_reply = "I could not generate a response at this time."
+                status.write("Assistant returned an empty reply")
+            else:
+                status.write("Assistant response generated")
+            with st.chat_message("assistant"):
+                st.markdown(assistant_reply)
+            st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
+            status.update(label="Done", state="complete")
 
 
 if __name__ == "__main__":
