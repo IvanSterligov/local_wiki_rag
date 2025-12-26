@@ -19,6 +19,7 @@ DEFAULT_SEARCH_LIMIT = 5
 SEARCH_BACKEND_LIMIT = 50
 DEFAULT_EXTRACT_CHARS = 1200
 MAX_SOURCES_CAP = 50
+RERANK_TOP_K = MAX_SOURCES_CAP
 CHUNK_TOKEN_TARGET = 300
 REQUEST_TIMEOUT = 30.0
 DEFAULT_USER_AGENT = os.getenv("WIKI_USER_AGENT", "LocalWikiRAG/1.0 (contact: local)")
@@ -39,8 +40,6 @@ TOOL_GATING_PROMPT = (
 ANSWER_SYSTEM_PROMPT = (
     "You are a local assistant. Use the SOURCES section when it is provided. "
     "Cite sources with [n] where n corresponds to the source number. "
-    "When SOURCES are present, cite at least three distinct sources when that many are provided; "
-    "if fewer are available, cite all of them. "
     "If SOURCES is empty, answer normally and clearly state when you do not have Wikipedia matches. "
     "Provide a thorough response roughly a page in length, elaborating on relevant context and details."
 )
@@ -218,7 +217,7 @@ def main() -> None:
     with col3:
         user_agent = st.text_input("Wikipedia User-Agent", value=DEFAULT_USER_AGENT)
     max_sources = st.slider(
-        "Max Wikipedia sources", 3, MAX_SOURCES_CAP, min(DEFAULT_SEARCH_LIMIT, MAX_SOURCES_CAP), 1
+        "Max Wikipedia sources (reranked)", 3, MAX_SOURCES_CAP, min(DEFAULT_SEARCH_LIMIT, MAX_SOURCES_CAP), 1
     )
 
     for message in st.session_state["messages"]:
