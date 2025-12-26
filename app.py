@@ -44,6 +44,12 @@ ANSWER_SYSTEM_PROMPT = (
     "Provide a thorough response roughly a page in length, elaborating on relevant context and details."
 )
 
+KEYWORD_QUERY_PROMPT = (
+    "You are preparing a Wikipedia query. "
+    "Extract the primary subject and the key modifiers as lowercase keywords separated by spaces. "
+    "Do not add commentary or punctuation—only the keywords."
+)
+
 
 def ollama_chat(model: str, messages: List[Dict[str, str]], timeout: float = REQUEST_TIMEOUT) -> str:
     payload = {"model": model, "messages": messages, "stream": False}
@@ -188,6 +194,16 @@ def decide_search(question: str, model: str) -> Tuple[bool, str]:
         return True, question
 
 
+def make_keyword_query(question: str, model: str) -> str:
+    messages = [
+        {"role": "system", "content": KEYWORD_QUERY_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    raw = ollama_chat(model, messages)
+    cleaned = raw.strip().replace("\n", " ")
+    return cleaned or question
+
+
 def format_user_with_sources(question: str, context: str) -> str:
     sources_block = context if context else "(none)"
     return f"Question: {question}\n\nSOURCES:\n{sources_block}"
@@ -219,6 +235,7 @@ def main() -> None:
     max_sources = st.slider(
         "Max Wikipedia sources (reranked)", 3, MAX_SOURCES_CAP, min(DEFAULT_SEARCH_LIMIT, MAX_SOURCES_CAP), 1
     )
+    use_bm25 = st.checkbox("Use BM25 rerank", value=True)
 
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
@@ -244,8 +261,10 @@ def main() -> None:
             if retrieval_mode == "Always Wikipedia":
                 status.write("Retrieval: forcing Wikipedia search")
                 _, query = decide_search(prompt, model)
-                status.write(f"Search query: '{query}' (limit {lexical_limit})")
-                search_results = wiki_search(query, backend_limit=lexical_limit, user_agent=user_agent)
+                keyword_query = make_keyword_query(query, model)
+                status.write(f"Keyword query: '{keyword_query}'")
+                status.write(f"Search query: '{keyword_query}' (limit {lexical_limit})")
+                search_results = wiki_search(keyword_query, backend_limit=lexical_limit, user_agent=user_agent)
             elif retrieval_mode == "Auto":
                 status.write("Retrieval: deciding whether to search Wikipedia")
                 should_search, query = decide_search(prompt, model)
@@ -254,7 +273,10 @@ def main() -> None:
                     + (f"searching Wikipedia for '{query}'" if should_search else "no search needed")
                 )
                 if should_search:
-                    search_results = wiki_search(query, backend_limit=lexical_limit, user_agent=user_agent)
+                    keyword_query = make_keyword_query(query, model)
+                    status.write(f"Keyword query: '{keyword_query}'")
+                    status.write(f"Search query: '{keyword_query}' (limit {lexical_limit})")
+                    search_results = wiki_search(keyword_query, backend_limit=lexical_limit, user_agent=user_agent)
             # No Wikipedia mode skips retrieval
 
             if search_results:
@@ -264,6 +286,26 @@ def main() -> None:
                 status.write(f"Selected top {len(search_results)} results")
                 pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
                 extracts = wiki_extracts(pageids, user_agent=user_agent)
+                if use_bm25:
+                    try:
+                        from rank_bm25 import BM25Okapi
+
+                        docs = []
+                        for result in search_results:
+                            pageid = int(result.get("pageid", 0))
+                            extract = extracts.get(pageid, {}).get("extract", "")
+                            if not extract:
+                                extract = _strip_html_snippet(result.get("snippet", ""))
+                            docs.append(extract or result.get("title", ""))
+                        tokenized_docs = [doc.lower().split() for doc in docs]
+                        bm25 = BM25Okapi(tokenized_docs)
+                        keyword_tokens = (keyword_query if 'keyword_query' in locals() else query).lower().split()
+                        scores = bm25.get_scores(keyword_tokens)
+                        scored = list(zip(search_results, scores))
+                        search_results = [item for item, _ in sorted(scored, key=lambda pair: pair[1], reverse=True)]
+                        status.write("BM25 rerank applied")
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        status.write(f"BM25 rerank skipped due to error: {exc}")
                 context, sources_display = build_context(
                     search_results, extracts, max_sources=max_sources
                 )
