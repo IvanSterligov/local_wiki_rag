@@ -16,7 +16,7 @@ OLLAMA_CHAT_ENDPOINT = f"{OLLAMA_URL}/api/chat"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_EXTRACT_CHARS = 4000
-REQUEST_TIMEOUT = 60.0
+REQUEST_TIMEOUT = 30.0
 DEFAULT_USER_AGENT = os.getenv("WIKI_USER_AGENT", "LocalWikiRAG/1.0 (contact: local)")
 
 MODEL_OPTIONS = ["phi4:14b", "llama3.1:8b-instruct-q5_K_M"]
@@ -51,12 +51,7 @@ def ollama_chat(model: str, messages: List[Dict[str, str]], timeout: float = REQ
         return ""
 
 
-def wiki_search(
-    query: str,
-    limit: int = DEFAULT_SEARCH_LIMIT,
-    user_agent: str = DEFAULT_USER_AGENT,
-    timeout: float = REQUEST_TIMEOUT,
-) -> List[Dict[str, Any]]:
+def wiki_search(query: str, limit: int = DEFAULT_SEARCH_LIMIT, user_agent: str = DEFAULT_USER_AGENT) -> List[Dict[str, Any]]:
     if not query:
         return []
     params = {
@@ -68,7 +63,7 @@ def wiki_search(
     }
     headers = {"User-Agent": user_agent}
     try:
-        resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=timeout)
+        resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json().get("query", {}).get("search", [])
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -76,12 +71,7 @@ def wiki_search(
         return []
 
 
-def wiki_extracts(
-    pageids: List[int],
-    chars: int = DEFAULT_EXTRACT_CHARS,
-    user_agent: str = DEFAULT_USER_AGENT,
-    timeout: float = REQUEST_TIMEOUT,
-) -> Dict[int, Dict[str, Any]]:
+def wiki_extracts(pageids: List[int], chars: int = DEFAULT_EXTRACT_CHARS, user_agent: str = DEFAULT_USER_AGENT) -> Dict[int, Dict[str, Any]]:
     if not pageids:
         return {}
     params = {
@@ -94,7 +84,7 @@ def wiki_extracts(
     }
     headers = {"User-Agent": user_agent}
     try:
-        resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=timeout)
+        resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {})
         return {int(pid): info for pid, info in pages.items()}
@@ -120,12 +110,12 @@ def build_context(search_results: List[Dict[str, Any]], extracts: Dict[int, Dict
     return context, sources
 
 
-def decide_search(question: str, model: str, timeout: float) -> Tuple[bool, str]:
+def decide_search(question: str, model: str) -> Tuple[bool, str]:
     messages = [
         {"role": "system", "content": TOOL_GATING_PROMPT},
         {"role": "user", "content": question},
     ]
-    raw_response = ollama_chat(model, messages, timeout=timeout)
+    raw_response = ollama_chat(model, messages)
     try:
         parsed = json.loads(raw_response)
         return bool(parsed.get("search", False)), str(parsed.get("query", question))
@@ -162,11 +152,6 @@ def main() -> None:
     with col3:
         user_agent = st.text_input("Wikipedia User-Agent", value=DEFAULT_USER_AGENT)
 
-    with st.expander("Advanced settings"):
-        st.caption("Tune request timeouts if your local models respond slowly.")
-        ollama_timeout = st.slider("Ollama timeout (seconds)", 10, 180, int(REQUEST_TIMEOUT))
-        wiki_timeout = st.slider("Wikipedia timeout (seconds)", 5, 60, int(REQUEST_TIMEOUT / 2))
-
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -176,59 +161,33 @@ def main() -> None:
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        progress = st.progress(0)
-        with st.status("Processing request...", expanded=True) as status:
-            status.write("Starting request...")
+        search_results: List[Dict[str, Any]] = []
+        extracts: Dict[int, Dict[str, Any]] = {}
+        context = ""
+        sources_display: List[Dict[str, str]] = []
 
-            search_results: List[Dict[str, Any]] = []
-            extracts: Dict[int, Dict[str, Any]] = {}
-            context = ""
-            sources_display: List[Dict[str, str]] = []
+        if retrieval_mode == "Always Wikipedia":
+            search_results = wiki_search(prompt, user_agent=user_agent)
+        elif retrieval_mode == "Auto":
+            should_search, query = decide_search(prompt, model)
+            if should_search:
+                search_results = wiki_search(query, user_agent=user_agent)
+        # No Wikipedia mode skips retrieval
 
-            if retrieval_mode == "Always Wikipedia":
-                status.write("Retrieval mode: always use Wikipedia.")
-                search_results = wiki_search(prompt, user_agent=user_agent, timeout=wiki_timeout)
-            elif retrieval_mode == "Auto":
-                status.write("Deciding whether Wikipedia lookup is needed...")
-                should_search, query = decide_search(prompt, model, timeout=ollama_timeout)
-                if should_search:
-                    status.write(f"Model requested Wikipedia search for: {query}")
-                    search_results = wiki_search(query, user_agent=user_agent, timeout=wiki_timeout)
-                else:
-                    status.write("Model skipped Wikipedia search for this turn.")
-            else:
-                status.write("Retrieval mode: No Wikipedia.")
+        if search_results:
+            pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
+            extracts = wiki_extracts(pageids, user_agent=user_agent)
+            context, sources_display = build_context(search_results, extracts)
 
-            progress.progress(0.35)
+        render_sources(sources_display)
 
-            if search_results:
-                status.write(f"Wikipedia search returned {len(search_results)} result(s). Fetching extracts...")
-                pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
-                extracts = wiki_extracts(pageids, user_agent=user_agent, timeout=wiki_timeout)
-                context, sources_display = build_context(search_results, extracts)
-                status.write(f"Prepared context from {len(sources_display)} source(s).")
-            else:
-                status.write("No Wikipedia results were used.")
-
-            progress.progress(0.6)
-            render_sources(sources_display)
-
-            answer_messages = [
-                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
-                {"role": "user", "content": format_user_with_sources(prompt, context)},
-            ]
-            status.write(f"Sending question to model '{model}'...")
-            assistant_reply = ollama_chat(model, answer_messages, timeout=ollama_timeout)
-            progress.progress(0.9)
-            if not assistant_reply:
-                assistant_reply = "I could not generate a response at this time."
-                status.write("Model did not return a response.")
-            else:
-                status.write("Received model response.")
-
-            status.update(label="Finished", state="complete")
-            progress.progress(1.0)
-
+        answer_messages = [
+            {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": format_user_with_sources(prompt, context)},
+        ]
+        assistant_reply = ollama_chat(model, answer_messages)
+        if not assistant_reply:
+            assistant_reply = "I could not generate a response at this time."
         with st.chat_message("assistant"):
             st.markdown(assistant_reply)
         st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
