@@ -5,7 +5,8 @@ A small Streamlit chat app that talks to local Ollama models and can optionally 
 ## Features
 - Switch between local Ollama models (`phi4:14b`, `llama3.1:8b-instruct-q5_K_M`).
 - Tool-gated Wikipedia retrieval with Auto/Always/Never modes.
-- MediaWiki API search + extracts with source previews and required User-Agent header.
+- MediaWiki Search API with article-only filtering, CirrusSearch-style query refinement, and a two-stage BM25 → neural rerank pipeline.
+- Passage-level extracts (lead sections, chunked) with source previews and required User-Agent header.
 - Chat history persistence in the UI and citations aligned with provided sources.
 
 ## Requirements
@@ -41,3 +42,5 @@ Open the displayed local URL in your browser. Select a model and retrieval mode,
 ## Notes
 - Ollama API endpoint defaults to `http://localhost:11434/api/chat`; adjust constants in `app.py` if your setup differs.
 - Only Wikipedia is queried for retrieval. The app continues gracefully if Wikipedia or Ollama requests fail.
+- Wikipedia retrieval uses `srnamespace=0` with tightened queries, reranking with `cross-encoder/ms-marco-MiniLM-L-6-v2`, and
+  lead-section passages to reduce prompt bloat.
