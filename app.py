@@ -46,8 +46,8 @@ ANSWER_SYSTEM_PROMPT = (
 
 KEYWORD_QUERY_PROMPT = (
     "You are preparing a Wikipedia query. "
-    "Extract the primary subject and the key modifiers as lowercase keywords separated by spaces. "
-    "Do not add commentary or punctuation—only the keywords."
+    "Return ONLY the core subject name needed to search for the topic on Wikipedia. "
+    "Do not include attributes or extra descriptors—just the minimal subject phrase in lowercase."
 )
 
 
@@ -201,7 +201,11 @@ def make_keyword_query(question: str, model: str) -> str:
     ]
     raw = ollama_chat(model, messages)
     cleaned = raw.strip().replace("\n", " ")
-    return cleaned or question
+    tokens = cleaned.split()
+    if tokens:
+        core_tokens = tokens[:3]
+        return " ".join(core_tokens)
+    return question
 
 
 def format_user_with_sources(question: str, context: str) -> str:
