@@ -9,7 +9,6 @@ import re
 from typing import Any, Dict, List, Tuple
 
 import httpx
-from sentence_transformers import CrossEncoder
 import streamlit as st
 
 # Constants
@@ -17,9 +16,9 @@ OLLAMA_URL = "http://localhost:11434"
 OLLAMA_CHAT_ENDPOINT = f"{OLLAMA_URL}/api/chat"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 DEFAULT_SEARCH_LIMIT = 5
-SEARCH_BACKEND_LIMIT = 20
+SEARCH_BACKEND_LIMIT = 50
 DEFAULT_EXTRACT_CHARS = 1200
-RERANK_TOP_K = 5
+MAX_SOURCES_CAP = 50
 CHUNK_TOKEN_TARGET = 300
 REQUEST_TIMEOUT = 30.0
 DEFAULT_USER_AGENT = os.getenv("WIKI_USER_AGENT", "LocalWikiRAG/1.0 (contact: local)")
@@ -40,7 +39,10 @@ TOOL_GATING_PROMPT = (
 ANSWER_SYSTEM_PROMPT = (
     "You are a local assistant. Use the SOURCES section when it is provided. "
     "Cite sources with [n] where n corresponds to the source number. "
-    "If SOURCES is empty, answer normally and clearly state when you do not have Wikipedia matches."
+    "When SOURCES are present, cite at least three distinct sources when that many are provided; "
+    "if fewer are available, cite all of them. "
+    "If SOURCES is empty, answer normally and clearly state when you do not have Wikipedia matches. "
+    "Provide a thorough response roughly a page in length, elaborating on relevant context and details."
 )
 
 
@@ -90,39 +92,23 @@ def wiki_search(
     try:
         resp = httpx.get(WIKI_API, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        return resp.json().get("query", {}).get("search", [])
+        results = resp.json().get("query", {}).get("search", [])
+        if results:
+            return results
+        # Fallback: try the raw query if the refined one yielded nothing.
+        if refined_query != query:
+            fallback_params = params.copy()
+            fallback_params["srsearch"] = query
+            resp = httpx.get(WIKI_API, params=fallback_params, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json().get("query", {}).get("search", [])
+        return results
     except Exception as exc:  # pylint: disable-broad-exception-caught
         st.error(f"Wikipedia search error: {exc}")
         return []
 
 
 @st.cache_resource(show_spinner=False)
-def get_reranker() -> CrossEncoder:
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-
-def rerank_search_results(
-    search_results: List[Dict[str, Any]], query: str, limit: int
-) -> List[Dict[str, Any]]:
-    if not search_results:
-        return []
-
-    reranker = get_reranker()
-    pairs = [
-        (query, f"{res.get('title', '')} {_strip_html_snippet(res.get('snippet', ''))}")
-        for res in search_results
-    ]
-    scores = reranker.predict(pairs)
-    rescored: List[Dict[str, Any]] = []
-    for res, score in zip(search_results, scores):
-        enriched = res.copy()
-        enriched["neural_score"] = float(score)
-        rescored.append(enriched)
-
-    ranked = sorted(rescored, key=lambda item: item.get("neural_score", 0.0), reverse=True)
-    return ranked[:limit]
-
-
 def wiki_extracts(
     pageids: List[int], chars: int = DEFAULT_EXTRACT_CHARS, user_agent: str = DEFAULT_USER_AGENT
 ) -> Dict[int, Dict[str, Any]]:
@@ -159,49 +145,32 @@ def chunk_text(text: str, target_words: int = CHUNK_TOKEN_TARGET) -> List[str]:
     return chunks
 
 
-def select_top_passages(
-    extracts: Dict[int, Dict[str, Any]], query: str
-) -> List[Tuple[int, str, str]]:
-    candidates: List[Tuple[int, str, str]] = []
-    for pageid, info in extracts.items():
-        title = info.get("title", "Untitled")
-        extract = info.get("extract", "")
-        for chunk in chunk_text(extract):
-            candidates.append((pageid, title, chunk))
-
-    if not candidates:
-        return []
-
-    reranker = get_reranker()
-    pairs = [(query, chunk) for _, _, chunk in candidates]
-    scores = reranker.predict(pairs)
-    scored_chunks = [
-        (pid, title, chunk, float(score))
-        for (pid, title, chunk), score in zip(candidates, scores)
-    ]
-    scored_chunks.sort(key=lambda item: item[3], reverse=True)
-    best_by_page: Dict[int, Tuple[int, str, str, float]] = {}
-    for pid, title, chunk, score in scored_chunks:
-        if pid not in best_by_page:
-            best_by_page[pid] = (pid, title, chunk, score)
-    return [(pid, title, chunk) for pid, title, chunk, _ in best_by_page.values()]
-
-
 def build_context(
-    search_results: List[Dict[str, Any]], extracts: Dict[int, Dict[str, Any]], query: str
+    search_results: List[Dict[str, Any]],
+    extracts: Dict[int, Dict[str, Any]],
+    max_sources: int,
+    min_citations: int = 3,
 ) -> Tuple[str, List[Dict[str, str]]]:
     sources: List[Dict[str, str]] = []
     lines: List[str] = []
-    top_passages = select_top_passages(extracts, query)
-    for pageid, title, passage in top_passages:
-        if all(src.get("title") != title for src in sources):
-            url = f"https://en.wikipedia.org/?curid={pageid}"
-            sources.append({"title": title, "url": url})
-        idx = next(
-            (i for i, src in enumerate(sources, start=1) if src.get("title") == title),
-            len(sources),
-        )
+    target = min(len(search_results), max(max_sources, min_citations))
+    for result in search_results:
+        pageid = int(result.get("pageid", 0))
+        info = extracts.get(pageid, {})
+        title = info.get("title") or result.get("title") or "Untitled"
+        extract = info.get("extract", "").strip()
+        if not extract:
+            extract = _strip_html_snippet(result.get("snippet", "")).strip()
+        chunks = chunk_text(extract) if extract else []
+        passage = chunks[0] if chunks else extract
+        if not passage:
+            continue
+        url = f"https://en.wikipedia.org/?curid={pageid}" if pageid else ""
+        sources.append({"title": title, "url": url or f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"})
+        idx = len(sources)
         lines.append(f"[{idx}] {title}\n{passage}\n")
+        if len(sources) >= target:
+            break
     context = "\n".join(lines)
     return context, sources
 
@@ -249,7 +218,7 @@ def main() -> None:
     with col3:
         user_agent = st.text_input("Wikipedia User-Agent", value=DEFAULT_USER_AGENT)
     max_sources = st.slider(
-        "Max Wikipedia sources (reranked)", 3, RERANK_TOP_K, min(DEFAULT_SEARCH_LIMIT, RERANK_TOP_K), 1
+        "Max Wikipedia sources", 3, MAX_SOURCES_CAP, min(DEFAULT_SEARCH_LIMIT, MAX_SOURCES_CAP), 1
     )
 
     for message in st.session_state["messages"]:
@@ -291,12 +260,14 @@ def main() -> None:
 
             if search_results:
                 status.write(f"Lexical results (BM25): {len(search_results)}")
-                top_k = min(max_sources, RERANK_TOP_K)
-                search_results = rerank_search_results(search_results, query, top_k)
-                status.write(f"Neural reranked to top {len(search_results)}")
+                selection_cap = min(len(search_results), max(max_sources, 3))
+                search_results = search_results[:selection_cap]
+                status.write(f"Selected top {len(search_results)} results")
                 pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
                 extracts = wiki_extracts(pageids, user_agent=user_agent)
-                context, sources_display = build_context(search_results, extracts, query)
+                context, sources_display = build_context(
+                    search_results, extracts, max_sources=max_sources
+                )
                 status.write(f"Built context from {len(sources_display)} sources")
             else:
                 status.write("Wikipedia search returned no results")
