@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Tuple
 
 import httpx
@@ -49,6 +50,12 @@ KEYWORD_QUERY_PROMPT = (
     "Return ONLY the core subject name needed to search for the topic on Wikipedia. "
     "Do not include attributes or extra descriptors—just the minimal subject phrase in lowercase."
 )
+
+
+def log_status(status: Any, message: str, started_at: float) -> float:
+    elapsed = time.perf_counter() - started_at
+    status.write(f"{message} ({elapsed:.2f}s)")
+    return time.perf_counter()
 
 
 def ollama_chat(model: str, messages: List[Dict[str, str]], timeout: float = REQUEST_TIMEOUT) -> str:
@@ -251,8 +258,9 @@ def main() -> None:
             st.markdown(prompt)
 
         with st.status("Processing request", expanded=True) as status:
-            status.write(f"Model: {model}")
-            status.write(f"Retrieval mode: {retrieval_mode}")
+            step_timer = time.perf_counter()
+            step_timer = log_status(status, f"Model: {model}", step_timer)
+            step_timer = log_status(status, f"Retrieval mode: {retrieval_mode}", step_timer)
 
             search_results: List[Dict[str, Any]] = []
             extracts: Dict[int, Dict[str, Any]] = {}
@@ -263,35 +271,56 @@ def main() -> None:
             lexical_limit = min(SEARCH_BACKEND_LIMIT, max_sources * 4)
 
             if retrieval_mode == "Always Wikipedia":
-                status.write("Retrieval: forcing Wikipedia search")
+                step_timer = log_status(status, "Retrieval: forcing Wikipedia search", step_timer)
+                decision_start = time.perf_counter()
                 _, query = decide_search(prompt, model)
                 keyword_query = make_keyword_query(query, model)
-                status.write(f"Keyword query: '{keyword_query}'")
-                status.write(f"Search query: '{keyword_query}' (limit {lexical_limit})")
-                search_results = wiki_search(keyword_query, backend_limit=lexical_limit, user_agent=user_agent)
+                step_timer = log_status(status, f"Keyword query: '{keyword_query}'", decision_start)
+                search_start = time.perf_counter()
+                search_results = wiki_search(
+                    keyword_query, backend_limit=lexical_limit, user_agent=user_agent
+                )
+                step_timer = log_status(
+                    status, f"Search query: '{keyword_query}' (limit {lexical_limit})", search_start
+                )
             elif retrieval_mode == "Auto":
-                status.write("Retrieval: deciding whether to search Wikipedia")
+                step_timer = log_status(status, "Retrieval: deciding whether to search Wikipedia", step_timer)
                 should_search, query = decide_search(prompt, model)
-                status.write(
+                step_timer = log_status(
+                    status,
                     "Auto decision: "
-                    + (f"searching Wikipedia for '{query}'" if should_search else "no search needed")
+                    + (f"searching Wikipedia for '{query}'" if should_search else "no search needed"),
+                    step_timer,
                 )
                 if should_search:
+                    keyword_start = time.perf_counter()
                     keyword_query = make_keyword_query(query, model)
-                    status.write(f"Keyword query: '{keyword_query}'")
-                    status.write(f"Search query: '{keyword_query}' (limit {lexical_limit})")
-                    search_results = wiki_search(keyword_query, backend_limit=lexical_limit, user_agent=user_agent)
+                    step_timer = log_status(status, f"Keyword query: '{keyword_query}'", keyword_start)
+                    search_start = time.perf_counter()
+                    search_results = wiki_search(
+                        keyword_query, backend_limit=lexical_limit, user_agent=user_agent
+                    )
+                    step_timer = log_status(
+                        status, f"Search query: '{keyword_query}' (limit {lexical_limit})", search_start
+                    )
             # No Wikipedia mode skips retrieval
 
             if search_results:
-                status.write(f"Lexical results (BM25): {len(search_results)}")
+                step_timer = log_status(
+                    status, f"Lexical results (BM25): {len(search_results)}", step_timer
+                )
                 selection_cap = min(len(search_results), max(max_sources, 3))
                 search_results = search_results[:selection_cap]
-                status.write(f"Selected top {len(search_results)} results")
+                step_timer = log_status(status, f"Selected top {len(search_results)} results", step_timer)
                 pageids = [int(item.get("pageid", 0)) for item in search_results if item.get("pageid")]
+                extract_start = time.perf_counter()
                 extracts = wiki_extracts(pageids, user_agent=user_agent)
+                step_timer = log_status(
+                    status, f"Fetched extracts for {len(pageids)} pages", extract_start
+                )
                 if use_bm25:
                     try:
+                        bm25_start = time.perf_counter()
                         from rank_bm25 import BM25Okapi
 
                         docs = []
@@ -307,15 +336,19 @@ def main() -> None:
                         scores = bm25.get_scores(keyword_tokens)
                         scored = list(zip(search_results, scores))
                         search_results = [item for item, _ in sorted(scored, key=lambda pair: pair[1], reverse=True)]
-                        status.write("BM25 rerank applied")
+                        step_timer = log_status(status, "BM25 rerank applied", bm25_start)
                     except Exception as exc:  # pylint: disable=broad-exception-caught
-                        status.write(f"BM25 rerank skipped due to error: {exc}")
+                        step_timer = log_status(
+                            status, f"BM25 rerank skipped due to error: {exc}", bm25_start
+                        )
                 context, sources_display = build_context(
                     search_results, extracts, max_sources=max_sources
                 )
-                status.write(f"Built context from {len(sources_display)} sources")
+                step_timer = log_status(
+                    status, f"Built context from {len(sources_display)} sources", step_timer
+                )
             else:
-                status.write("Wikipedia search returned no results")
+                step_timer = log_status(status, "Wikipedia search returned no results", step_timer)
 
             render_sources(sources_display)
 
@@ -323,12 +356,13 @@ def main() -> None:
                 {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": format_user_with_sources(prompt, context)},
             ]
+            answer_start = time.perf_counter()
             assistant_reply = ollama_chat(model, answer_messages)
             if not assistant_reply:
                 assistant_reply = "I could not generate a response at this time."
-                status.write("Assistant returned an empty reply")
+                step_timer = log_status(status, "Assistant returned an empty reply", answer_start)
             else:
-                status.write("Assistant response generated")
+                step_timer = log_status(status, "Assistant response generated", answer_start)
             with st.chat_message("assistant"):
                 st.markdown(assistant_reply)
             st.session_state["messages"].append({"role": "assistant", "content": assistant_reply})
